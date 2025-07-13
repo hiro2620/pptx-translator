@@ -1,6 +1,6 @@
 # PDF Translator
 
-PowerPointプレゼンテーション(.pptx)ファイルを翻訳するツールです。Google Gemini APIを使用して文脈を維持して翻訳を行います。
+PowerPointプレゼンテーション(.pptx)ファイルを翻訳するツールです。Google Gemini APIを使用し、文脈を維持して翻訳を行います。
 
 日本語から英語への翻訳を主にサポートしていますが、他の言語にも対応しています。
 
@@ -54,18 +54,18 @@ pip install -r requirements.txt
 
 ## API設定
 
-Google Gemini APIを使用するためのAPI キーが必要です。
+Google Gemini APIを使用するためのAPIキーが必要です。
 
-1. Google AI Studio(https://aistudio.google.com/apikey)でAPIキーを取得
+1. Google AI Studio (https://aistudio.google.com/apikey) でAPIキーを取得
 2. 環境変数に設定
 
 ```bash
-export GOOGLE_AI_API_KEY="your-api-key-here"
+export GEMINI_API_KEY="your-api-key-here"
 ```
 
 または `.env` ファイルを作成して設定
 ```
-GOOGLE_AI_API_KEY=your-api-key-here
+GEMINI_API_KEY=your-api-key-here
 ```
 `.env`ファイルの自動読み込みには対応していないので、以下のコマンドで手動で読み込む必要があります。
 ```bash
@@ -75,10 +75,15 @@ source ./.env
 ## 使用方法
 
 ### 基本的な使用方法
-
 ```bash
 python main.py input.pptx
 ```
+
+uvを使用する場合は
+```bash
+uv run main.py input.pptx
+```
+のように実行することもできます。
 
 日本語から英語に翻訳されたファイルが `input_en.pptx` として保存されます。
 
@@ -91,7 +96,7 @@ python main.py input.pptx -o output.pptx -s ja -t en -m gemini-2.5-flash
 #### コマンドライン引数
 
 - `input_file`: 翻訳するPPTXファイルのパス
-- `-o, --output`: 出力ファイル名（オプション）
+- `-o, --output`: 出力ファイル名(デフォルト: `<input_file_name>_<target_lang>.pptx`)
 - `-s, --source`: 翻訳元言語(デフォルト: ja)
 - `-t, --target`: 翻訳先言語(デフォルト: en)
 - `-m, --model`: 使用するGeminiモデル(デフォルト: gemini-2.5-flash)
@@ -145,5 +150,5 @@ python main.py presentation.pptx -m gemini-2.0-flash-exp
 ### 制限事項
 
 - PowerPointファイル(.pptx)のみ対応
-- 一部のテキストは翻訳されない場合があります
+- 文字の色が引き継がれないことがあります。
 - 複雑なレイアウトや図形では文字が検出されないことがあります。
