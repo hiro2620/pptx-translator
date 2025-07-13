@@ -7,12 +7,18 @@ import logging
 import sys
 import argparse
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 import shutil
 import json
 from dataclasses import dataclass
 from pptx import Presentation
+from pptx.text.text import TextFrame, _Paragraph, _Run
+from pptx.shapes.shapetree import SlideShapes
 from google import genai
+
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,6 +50,15 @@ class TableCellPosition(TextPosition):
     table_col: int = -1
 
 @dataclass
+class GroupedShapePosition(TextPosition):
+    """グループ化された図形のテキスト位置情報を格納するデータクラス"""
+    group_path: List[int] = None  # グループ内のパス（ネストしたインデックス）
+    
+    def __post_init__(self) -> None:
+        if self.group_path is None:
+            self.group_path = []
+
+@dataclass
 class TextPositionPair:
     """テキストと位置情報のペアを格納するデータクラス"""
     text: str
@@ -55,11 +70,8 @@ class PresentationData:
     all_pairs: List[TextPositionPair]
 
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 class PPTXTranslator:
-    def __init__(self, source_lang: str = "ja", target_lang: str = "en", model_name: str = "gemini-2.5-flash", logger=logger):
+    def __init__(self, source_lang: str = "ja", target_lang: str = "en", model_name: str = "gemini-2.5-flash", logger: logging.Logger = logger) -> None:
         self.logger = logger
         self.source_lang = source_lang
         self.target_lang = target_lang
@@ -116,9 +128,63 @@ class PPTXTranslator:
         
         for slide_idx, slide in enumerate(prs.slides):
             for shape_idx, shape in enumerate(slide.shapes):
-                # 通常のテキストフレーム
-                if hasattr(shape, 'text_frame') and shape.text_frame:
-                    for para_idx, paragraph in enumerate(shape.text_frame.paragraphs):
+                # 再帰的にシェイプを処理（グループ化された図形にも対応）
+                self._process_shape_recursive(shape, slide_idx, shape_idx, all_pairs)
+        
+        return PresentationData(all_pairs=all_pairs)
+    
+    def _process_shape_recursive(self, shape: SlideShapes, slide_idx: int, shape_idx: int, all_pairs: List[TextPositionPair], group_path: Optional[List[int]] = None) -> None:
+        """シェイプを再帰的に処理（グループ化された図形にも対応）"""
+        if group_path is None:
+            group_path = []
+        
+        # グループ化された図形の場合
+        if hasattr(shape, 'shapes'):
+            # グループ内の各シェイプを再帰的に処理
+            for sub_shape_idx, sub_shape in enumerate(shape.shapes):
+                new_group_path = group_path + [sub_shape_idx]
+                self._process_shape_recursive(sub_shape, slide_idx, shape_idx, all_pairs, new_group_path)
+        
+        # 通常のテキストフレーム
+        elif hasattr(shape, 'text_frame') and shape.text_frame:
+            for para_idx, paragraph in enumerate(shape.text_frame.paragraphs):
+                text = paragraph.text.strip()
+                if not text:
+                    continue
+                
+                # runのスタイル情報を収集
+                run_styles = self._extract_run_styles(paragraph)
+                
+                # グループ化されている場合の位置情報
+                if group_path:
+                    position = GroupedShapePosition(
+                        slide_idx=slide_idx,
+                        shape_idx=shape_idx,
+                        para_idx=para_idx,
+                        original_text=text,
+                        run_styles=run_styles,
+                        group_path=group_path.copy()
+                    )
+                else:
+                    position = TextPosition(
+                        slide_idx=slide_idx,
+                        shape_idx=shape_idx,
+                        para_idx=para_idx,
+                        original_text=text,
+                        run_styles=run_styles
+                    )
+                
+                pair = TextPositionPair(text=text, position=position)
+                all_pairs.append(pair)
+        
+        # テーブル
+        elif hasattr(shape, 'table') and shape.table:
+            table = shape.table
+            for row_idx, row in enumerate(table.rows):
+                for col_idx, cell in enumerate(row.cells):
+                    if not (hasattr(cell, 'text_frame') and cell.text_frame):
+                        continue
+                    for para_idx, paragraph in enumerate(cell.text_frame.paragraphs):
                         text = paragraph.text.strip()
                         if not text:
                             continue
@@ -126,48 +192,26 @@ class PPTXTranslator:
                         # runのスタイル情報を収集
                         run_styles = self._extract_run_styles(paragraph)
                         
-                        position = TextPosition(
-                            slide_idx=slide_idx,
-                            shape_idx=shape_idx,
-                            para_idx=para_idx,
-                            original_text=text,
-                            run_styles=run_styles
-                        )
+                        # テーブルセル用の位置情報（グループ化されている場合も考慮）
+                        if group_path:
+                            # グループ化されたテーブルの場合は、今回は対応しない
+                            # 必要に応じて後で実装
+                            continue
+                        else:
+                            position = TableCellPosition(
+                                slide_idx=slide_idx,
+                                shape_idx=shape_idx,
+                                table_row=row_idx,
+                                table_col=col_idx,
+                                para_idx=para_idx,
+                                original_text=text,
+                                run_styles=run_styles
+                            )
                         
                         pair = TextPositionPair(text=text, position=position)
                         all_pairs.append(pair)
-                
-                # テーブル
-                elif hasattr(shape, 'table') and shape.table:
-                    table = shape.table
-                    for row_idx, row in enumerate(table.rows):
-                        for col_idx, cell in enumerate(row.cells):
-                            if hasattr(cell, 'text_frame') and cell.text_frame:
-                                for para_idx, paragraph in enumerate(cell.text_frame.paragraphs):
-                                    text = paragraph.text.strip()
-                                    if not text:
-                                        continue
-                                    
-                                    # runのスタイル情報を収集
-                                    run_styles = self._extract_run_styles(paragraph)
-                                    
-                                    # テーブルセル用の位置情報
-                                    position = TableCellPosition(
-                                        slide_idx=slide_idx,
-                                        shape_idx=shape_idx,
-                                        table_row=row_idx,
-                                        table_col=col_idx,
-                                        para_idx=para_idx,
-                                        original_text=text,
-                                        run_styles=run_styles
-                                    )
-                                    
-                                    pair = TextPositionPair(text=text, position=position)
-                                    all_pairs.append(pair)
-        
-        return PresentationData(all_pairs=all_pairs)
     
-    def _extract_run_styles(self, paragraph) -> List[RunStyleInfo]:
+    def _extract_run_styles(self, paragraph: _Paragraph) -> List[RunStyleInfo]:
         """paragraphからrunのスタイル情報を抽出"""
         run_styles = []
         for run in paragraph.runs:
@@ -188,8 +232,7 @@ class PPTXTranslator:
             if hasattr(font, 'color') and font.color:
                 color_obj = font.color
                 if hasattr(color_obj, 'rgb') and color_obj.rgb:
-                    rgb = color_obj.rgb
-                    color_rgb = (rgb.r, rgb.g, rgb.b)
+                    color_rgb = color_obj.rgb
                 elif hasattr(color_obj, 'theme_color') and color_obj.theme_color is not None:
                     color_theme = int(color_obj.theme_color)
                     if hasattr(color_obj, 'brightness') and color_obj.brightness is not None:
@@ -210,7 +253,7 @@ class PPTXTranslator:
         
         return run_styles
     
-    def translate_presentation_with_gemini(self, presentation_data: PresentationData) -> tuple[List[str], List[List[dict]]]:
+    def translate_presentation_with_gemini(self, presentation_data: PresentationData) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
         """Gemini APIを使用したプレゼンテーション全体の翻訳"""
         if not presentation_data.all_pairs:
             return [], []
@@ -246,6 +289,22 @@ class PPTXTranslator:
         prompt = f"""
 Translate the following texts from {source_lang_name} to {target_lang_name}.
 Maintain the same tone and style. Keep technical terms consistent.
+
+IMPORTANT - CONTEXT AND NUANCE PRESERVATION:
+- Consider the overall context of the presentation when translating each text
+- Preserve the original text's nuance, emotional tone, and formality level
+- Maintain consistency in terminology and style throughout the entire presentation
+- Pay attention to the relationship between different text elements (titles, bullet points, etc.)
+- Ensure translations flow naturally while preserving the original meaning and intent
+- Consider cultural context and adapt expressions appropriately for the target language
+
+CRITICAL - LENGTH AND CONTENT ACCURACY:
+- Keep the translation as close as possible to the original text length
+- Do NOT add extra explanations, elaborations, or supplementary information
+- Do NOT omit or skip any parts of the original text
+- Translate only what is present in the original - nothing more, nothing less
+- Prioritize accuracy and completeness over natural flow when there's a conflict
+- Each translated element should correspond directly to the original element
 
 IMPORTANT: Each text consists of multiple "runs" with different styles. You must provide a "run_mapping" that maps parts of your translation to specific original run indices.
 
@@ -296,168 +355,47 @@ Return the translations in the specified JSON schema format.
         translations, run_mappings = self._parse_json_translations_with_mapping(response.text, presentation_data.all_pairs)
         return translations, run_mappings
     
-    def _parse_json_translations_with_mapping(self, response_text: str, all_pairs: List[TextPositionPair]) -> tuple[List[str], List[List[dict]]]:
+    def _parse_json_translations_with_mapping(self, response_text: str, all_pairs: List[TextPositionPair]) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
         """JSON形式の翻訳レスポンス（run_mapping付き）をパース"""
         try:
-            response_data = json.loads(response_text)
-            translations_data = response_data.get("translations", [])
-            
-            # IDでソートして順序を保証
-            translations_data.sort(key=lambda x: x.get("id", 0))
-            
-            translations = []
-            run_mappings = []
-            
-            for i, pair in enumerate(all_pairs):
-                found_translation = None
-                found_run_mapping = []
-                
-                for trans_item in translations_data:
-                    if trans_item.get("id") == i:
-                        found_translation = trans_item.get("translated", "")
-                        found_run_mapping = trans_item.get("run_mapping", [])
-                        break
-                
-                if found_translation is None:
-                    # デフォルトの処理
-                    found_translation = pair.text
-                    found_run_mapping = [
-                        {"original_run_index": j, "translated_text": style.text}
-                        for j, style in enumerate(pair.position.run_styles)
-                    ]
-                else:
-                    # run mappingの整合性をチェック
-                    found_run_mapping = self._validate_run_mapping(found_translation, found_run_mapping, pair.position.run_styles)
-                
-                translations.append(found_translation)
-                run_mappings.append(found_run_mapping)
-            
-            self.logger.info(f"翻訳完了: {len(translations)} 件")
-            return translations, run_mappings
-            
+            response_data: Dict[str, Any] = json.loads(response_text)
         except json.JSONDecodeError as e:
             self.logger.error(f"JSONパースエラー: {e}")
-            # フォールバック処理
-            translations = [pair.text for pair in all_pairs]
-            run_mappings = [
-                [{"original_run_index": j, "translated_text": style.text}
-                 for j, style in enumerate(pair.position.run_styles)]
-                for pair in all_pairs
-            ]
-            return translations, run_mappings
+            raise ValueError("Invalid JSON response format")
+        translations_data = response_data.get("translations", [])
+        
+        # IDでソートして順序を保証
+        translations_data.sort(key=lambda x: x.get("id", 0))
+
+        translations = []
+        run_mappings = []
+
+        for i, pair in enumerate(all_pairs):
+            found_translation = None
+            found_run_mapping = []
+
+            for trans_item in translations_data:
+                if trans_item.get("id") == i:
+                    found_translation = trans_item.get("translated", "")
+                    found_run_mapping = trans_item.get("run_mapping", [])
+                    break
+            
+            if found_translation is None:
+                # デフォルトの処理
+                found_translation = pair.text
+                found_run_mapping = [
+                    {"original_run_index": j, "translated_text": style.text}
+                    for j, style in enumerate(pair.position.run_styles)
+                ]
+            
+            translations.append(found_translation)
+            run_mappings.append(found_run_mapping)
+        
+        self.logger.info(f"翻訳完了: {len(translations)} 件")
+        return translations, run_mappings
+
     
-    def _validate_run_mapping(self, translated_text: str, run_mapping: List[dict], original_run_styles: List[RunStyleInfo]) -> List[dict]:
-        """run mappingの整合性をチェックし、必要に応じて修正"""
-        try:
-            # run mappingのテキストを結合して翻訳テキストと一致するかチェック
-            concatenated = "".join([item.get("translated_text", "") for item in run_mapping])
-            
-            if concatenated == translated_text:
-                # 整合性OK
-                return run_mapping
-            
-            self.logger.warning(f"run mapping不整合: '{concatenated}' != '{translated_text}'")
-            
-            # スペースの問題を修正する試行
-            fixed_mapping = self._fix_space_issues(translated_text, run_mapping, original_run_styles)
-            if fixed_mapping:
-                return fixed_mapping
-            
-            # 修正できない場合はフォールバック
-            self.logger.warning("run mapping修正失敗、フォールバックを使用")
-            return self._create_fallback_mapping(translated_text, original_run_styles)
-            
-        except Exception as e:
-            self.logger.error(f"run mapping検証エラー: {e}")
-            return self._create_fallback_mapping(translated_text, original_run_styles)
-    
-    def _fix_space_issues(self, translated_text: str, run_mapping: List[dict], original_run_styles: List[RunStyleInfo]) -> List[dict]:
-        """スペースの問題を修正"""
-        try:
-            # run mappingから翻訳テキストを結合
-            mapped_text = "".join([item.get("translated_text", "") for item in run_mapping])
-            
-            # 既に一致している場合は修正不要
-            if mapped_text == translated_text:
-                return run_mapping
-            
-            
-            # スペースが欠落している可能性をチェック
-            mapped_indices = {item.get("original_run_index", -1) for item in run_mapping}
-            missing_runs = []
-            
-            for i, style in enumerate(original_run_styles):
-                if i not in mapped_indices:
-                    # 欠落しているrunを特定
-                    if (style.text.strip() == "" or  # スペースのみのrun
-                        style.text.startswith(" ") or style.text.endswith(" ") or  # 先頭・末尾にスペース
-                        style.text.startswith("\t") or style.text.endswith("\t")):  # タブ
-                        missing_runs.append(i)
-            
-            if missing_runs:
-                # 欠落したrunを追加して修正を試行
-                fixed_mapping = list(run_mapping)
-                for run_index in missing_runs:
-                    run_text = original_run_styles[run_index].text
-                    fixed_mapping.append({
-                        "original_run_index": run_index,
-                        "translated_text": run_text
-                    })
-                
-                # インデックスでソート
-                fixed_mapping.sort(key=lambda x: x.get("original_run_index", 0))
-                
-                # 結合して確認
-                concatenated = "".join([item.get("translated_text", "") for item in fixed_mapping])
-                if concatenated == translated_text:
-                    self.logger.info("先頭・末尾スペース問題を修正しました")
-                    return fixed_mapping
-            
-            # 別のアプローチ: 翻訳テキストの先頭・末尾スペースをチェック
-            if translated_text != mapped_text:
-                # 先頭・末尾にスペースが必要か判定
-                needs_leading_space = translated_text.startswith(" ") and not mapped_text.startswith(" ")
-                needs_trailing_space = translated_text.endswith(" ") and not mapped_text.endswith(" ")
-                
-                if needs_leading_space or needs_trailing_space:
-                    # 適切なrunにスペースを追加
-                    fixed_mapping = self._add_missing_spaces(run_mapping, needs_leading_space, needs_trailing_space)
-                    if fixed_mapping:
-                        concatenated = "".join([item.get("translated_text", "") for item in fixed_mapping])
-                        if concatenated == translated_text:
-                            self.logger.info("先頭・末尾スペースを追加しました")
-                            return fixed_mapping
-            
-            return None
-            
-        except Exception as e:
-            self.logger.error(f"スペース修正エラー: {e}")
-            return None
-    
-    def _add_missing_spaces(self, run_mapping: List[dict], needs_leading: bool, needs_trailing: bool) -> List[dict]:
-        """欠落したスペースをrun mappingに追加"""
-        try:
-            fixed_mapping = list(run_mapping)
-            
-            if needs_leading:
-                # 最初のrunに先頭スペースを追加
-                if fixed_mapping:
-                    first_item = fixed_mapping[0]
-                    first_item["translated_text"] = " " + first_item.get("translated_text", "")
-            
-            if needs_trailing:
-                # 最後のrunに末尾スペースを追加
-                if fixed_mapping:
-                    last_item = fixed_mapping[-1]
-                    last_item["translated_text"] = last_item.get("translated_text", "") + " "
-            
-            return fixed_mapping
-            
-        except Exception as e:
-            self.logger.error(f"スペース追加エラー: {e}")
-            return None
-    
-    def _create_fallback_mapping(self, translated_text: str, original_run_styles: List[RunStyleInfo]) -> List[dict]:
+    def _create_fallback_mapping(self, translated_text: str, original_run_styles: List[RunStyleInfo]) -> List[Dict[str, Any]]:
         """フォールバックのrun mappingを作成"""
         if not original_run_styles:
             return [{"original_run_index": 0, "translated_text": translated_text}]
@@ -465,7 +403,7 @@ Return the translations in the specified JSON schema format.
         # 最初のrunに全テキストを割り当て
         return [{"original_run_index": 0, "translated_text": translated_text}]
     
-    def apply_run_style(self, run, run_style: RunStyleInfo):
+    def apply_run_style(self, run: _Run, run_style: RunStyleInfo) -> None:
         """runにスタイルを適用"""
         try:
             font = run.font
@@ -520,7 +458,7 @@ Return the translations in the specified JSON schema format.
         except Exception as e:
             self.logger.debug(f"スタイル適用エラー: {e}")
     
-    def replace_text_with_run_mapping(self, paragraph, translated_text: str, run_styles: List[RunStyleInfo], run_mapping: List[dict]):
+    def replace_text_with_run_mapping(self, paragraph: _Paragraph, translated_text: str, run_styles: List[RunStyleInfo], run_mapping: List[Dict[str, Any]]) -> None:
         """run_mappingを使用してスタイルを保持してテキストを置換"""
         try:
             if not run_styles or not run_mapping:
@@ -577,11 +515,6 @@ Return the translations in the specified JSON schema format.
                 return False
 
             self.logger.info(f"翻訳開始: {input_path}")
-            # テーブルテキストの統計を取得
-            table_texts = sum(1 for pair in presentation_data.all_pairs if isinstance(pair.position, TableCellPosition))
-            regular_texts = len(presentation_data.all_pairs) - table_texts
-            
-            self.logger.info(f"翻訳対象テキスト数: {len(presentation_data.all_pairs)} (通常: {regular_texts}, テーブル: {table_texts})")
 
             # プレゼンテーション全体を翻訳
             translations, run_mappings = self.translate_presentation_with_gemini(presentation_data)
@@ -597,11 +530,20 @@ Return the translations in the specified JSON schema format.
                     slide = prs.slides[position.slide_idx]
                     shape = slide.shapes[position.shape_idx]
                     
+                    # グループ化された図形の場合
+                    if isinstance(position, GroupedShapePosition):
+                        # group_pathに従って階層的にシェイプを取得
+                        current_shape = shape
+                        for group_idx in position.group_path:
+                            current_shape = current_shape.shapes[group_idx]
+                        paragraph = current_shape.text_frame.paragraphs[position.para_idx]
+                    
                     # テーブルセルの場合
-                    if isinstance(position, TableCellPosition):
+                    elif isinstance(position, TableCellPosition):
                         table = shape.table
                         cell = table.rows[position.table_row].cells[position.table_col]
                         paragraph = cell.text_frame.paragraphs[position.para_idx]
+                    
                     else:
                         # 通常のテキストフレーム
                         paragraph = shape.text_frame.paragraphs[position.para_idx]
@@ -622,10 +564,10 @@ Return the translations in the specified JSON schema format.
             return False
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="PPTX翻訳スクリプト (Gemini API使用)")
     parser.add_argument("input_file", help="入力PPTXファイル")
-    parser.add_argument("-o", "--output", help="出力PPTXファイル")
+    parser.add_argument("-o", "--output", help="出力PPTXファイル (デフォルト: <input_file_name>_<target_lang>.pptx)")
     parser.add_argument("-s", "--source", default="ja", help="翻訳元言語 (デフォルト: ja)")
     parser.add_argument("-t", "--target", default="en", help="翻訳先言語 (デフォルト: en)")
     parser.add_argument("-m", "--model", default="gemini-2.5-flash", help="使用するモデル名 (デフォルト: gemini-2.5-flash)")
