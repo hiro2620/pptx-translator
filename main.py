@@ -38,6 +38,12 @@ class TextPosition:
     run_styles: List[RunStyleInfo]
 
 @dataclass
+class TableCellPosition(TextPosition):
+    """テーブルセルのテキスト位置情報を格納するデータクラス"""
+    table_row: int = -1
+    table_col: int = -1
+
+@dataclass
 class TextPositionPair:
     """テキストと位置情報のペアを格納するデータクラス"""
     text: str
@@ -110,6 +116,7 @@ class PPTXTranslator:
         
         for slide_idx, slide in enumerate(prs.slides):
             for shape_idx, shape in enumerate(slide.shapes):
+                # 通常のテキストフレーム
                 if hasattr(shape, 'text_frame') and shape.text_frame:
                     for para_idx, paragraph in enumerate(shape.text_frame.paragraphs):
                         text = paragraph.text.strip()
@@ -117,44 +124,7 @@ class PPTXTranslator:
                             continue
                         
                         # runのスタイル情報を収集
-                        run_styles = []
-                        for run in paragraph.runs:
-                            if not run.text:
-                                continue
-                            
-                            font = run.font
-                            
-                            # フォントサイズの取得
-                            font_size_pt = None
-                            if hasattr(font, 'size') and font.size is not None:
-                                font_size_pt = font.size.pt
-                            
-                            # 色情報の取得
-                            color_rgb = None
-                            color_theme = None
-                            color_brightness = None
-                            if hasattr(font, 'color') and font.color:
-                                color_obj = font.color
-                                if hasattr(color_obj, 'rgb') and color_obj.rgb:
-                                    rgb = color_obj.rgb
-                                    color_rgb = (rgb.r, rgb.g, rgb.b)
-                                elif hasattr(color_obj, 'theme_color') and color_obj.theme_color is not None:
-                                    color_theme = int(color_obj.theme_color)
-                                    if hasattr(color_obj, 'brightness') and color_obj.brightness is not None:
-                                        color_brightness = float(color_obj.brightness)
-                            
-                            run_style = RunStyleInfo(
-                                text=run.text,
-                                font_name=getattr(font, 'name', None),
-                                font_size=font_size_pt,
-                                bold=getattr(font, 'bold', None),
-                                italic=getattr(font, 'italic', None),
-                                underline=getattr(font, 'underline', None),
-                                color_rgb=color_rgb,
-                                color_theme=color_theme,
-                                color_brightness=color_brightness
-                            )
-                            run_styles.append(run_style)
+                        run_styles = self._extract_run_styles(paragraph)
                         
                         position = TextPosition(
                             slide_idx=slide_idx,
@@ -166,8 +136,79 @@ class PPTXTranslator:
                         
                         pair = TextPositionPair(text=text, position=position)
                         all_pairs.append(pair)
+                
+                # テーブル
+                elif hasattr(shape, 'table') and shape.table:
+                    table = shape.table
+                    for row_idx, row in enumerate(table.rows):
+                        for col_idx, cell in enumerate(row.cells):
+                            if hasattr(cell, 'text_frame') and cell.text_frame:
+                                for para_idx, paragraph in enumerate(cell.text_frame.paragraphs):
+                                    text = paragraph.text.strip()
+                                    if not text:
+                                        continue
+                                    
+                                    # runのスタイル情報を収集
+                                    run_styles = self._extract_run_styles(paragraph)
+                                    
+                                    # テーブルセル用の位置情報
+                                    position = TableCellPosition(
+                                        slide_idx=slide_idx,
+                                        shape_idx=shape_idx,
+                                        table_row=row_idx,
+                                        table_col=col_idx,
+                                        para_idx=para_idx,
+                                        original_text=text,
+                                        run_styles=run_styles
+                                    )
+                                    
+                                    pair = TextPositionPair(text=text, position=position)
+                                    all_pairs.append(pair)
         
         return PresentationData(all_pairs=all_pairs)
+    
+    def _extract_run_styles(self, paragraph) -> List[RunStyleInfo]:
+        """paragraphからrunのスタイル情報を抽出"""
+        run_styles = []
+        for run in paragraph.runs:
+            if not run.text:
+                continue
+            
+            font = run.font
+            
+            # フォントサイズの取得
+            font_size_pt = None
+            if hasattr(font, 'size') and font.size is not None:
+                font_size_pt = font.size.pt
+            
+            # 色情報の取得
+            color_rgb = None
+            color_theme = None
+            color_brightness = None
+            if hasattr(font, 'color') and font.color:
+                color_obj = font.color
+                if hasattr(color_obj, 'rgb') and color_obj.rgb:
+                    rgb = color_obj.rgb
+                    color_rgb = (rgb.r, rgb.g, rgb.b)
+                elif hasattr(color_obj, 'theme_color') and color_obj.theme_color is not None:
+                    color_theme = int(color_obj.theme_color)
+                    if hasattr(color_obj, 'brightness') and color_obj.brightness is not None:
+                        color_brightness = float(color_obj.brightness)
+            
+            run_style = RunStyleInfo(
+                text=run.text,
+                font_name=getattr(font, 'name', None),
+                font_size=font_size_pt,
+                bold=getattr(font, 'bold', None),
+                italic=getattr(font, 'italic', None),
+                underline=getattr(font, 'underline', None),
+                color_rgb=color_rgb,
+                color_theme=color_theme,
+                color_brightness=color_brightness
+            )
+            run_styles.append(run_style)
+        
+        return run_styles
     
     def translate_presentation_with_gemini(self, presentation_data: PresentationData) -> tuple[List[str], List[List[dict]]]:
         """Gemini APIを使用したプレゼンテーション全体の翻訳"""
@@ -536,7 +577,11 @@ Return the translations in the specified JSON schema format.
                 return False
 
             self.logger.info(f"翻訳開始: {input_path}")
-            self.logger.info(f"翻訳対象テキスト数: {len(presentation_data.all_pairs)}")
+            # テーブルテキストの統計を取得
+            table_texts = sum(1 for pair in presentation_data.all_pairs if isinstance(pair.position, TableCellPosition))
+            regular_texts = len(presentation_data.all_pairs) - table_texts
+            
+            self.logger.info(f"翻訳対象テキスト数: {len(presentation_data.all_pairs)} (通常: {regular_texts}, テーブル: {table_texts})")
 
             # プレゼンテーション全体を翻訳
             translations, run_mappings = self.translate_presentation_with_gemini(presentation_data)
@@ -551,7 +596,15 @@ Return the translations in the specified JSON schema format.
                     # 対象のシェイプと段落を取得
                     slide = prs.slides[position.slide_idx]
                     shape = slide.shapes[position.shape_idx]
-                    paragraph = shape.text_frame.paragraphs[position.para_idx]
+                    
+                    # テーブルセルの場合
+                    if isinstance(position, TableCellPosition):
+                        table = shape.table
+                        cell = table.rows[position.table_row].cells[position.table_col]
+                        paragraph = cell.text_frame.paragraphs[position.para_idx]
+                    else:
+                        # 通常のテキストフレーム
+                        paragraph = shape.text_frame.paragraphs[position.para_idx]
                     
                     # run mappingを使用してテキストを置換
                     self.replace_text_with_run_mapping(paragraph, translation, position.run_styles, run_mapping)
@@ -561,7 +614,7 @@ Return the translations in the specified JSON schema format.
                     continue
 
             prs.save(output_path)
-            self.logger.info(f"翻訳完了: {output_path}")
+            self.logger.info(f"{output_path}に保存しました。")
             return True
             
         except Exception as e:
