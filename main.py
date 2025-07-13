@@ -71,12 +71,13 @@ class PresentationData:
 
 
 class PPTXTranslator:
-    def __init__(self, source_lang: str = "ja", target_lang: str = "en", model_name: str = "gemini-2.5-flash", logger: logging.Logger = logger) -> None:
+    def __init__(self, source_lang: str = "ja", target_lang: str = "en", model_name: str = "gemini-2.5-flash", logger: logging.Logger = logger, show_correspondence: bool = False) -> None:
         self.logger = logger
         self.source_lang = source_lang
         self.target_lang = target_lang
+        self.show_correspondence = show_correspondence
         
-        # JSON Schemaを定義
+        # JSON Schemaを定義（翻訳後run分割と対応付きで）
         self.translation_schema = {
             "type": "object",
             "properties": {
@@ -87,19 +88,19 @@ class PPTXTranslator:
                         "properties": {
                             "id": {"type": "integer"},
                             "translated": {"type": "string"},
-                            "run_mapping": {
+                            "translated_runs": {
                                 "type": "array",
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "original_run_index": {"type": "integer"},
-                                        "translated_text": {"type": "string"}
+                                        "text": {"type": "string"},
+                                        "best_match_original_run": {"type": "integer"}
                                     },
-                                    "required": ["original_run_index", "translated_text"]
+                                    "required": ["text", "best_match_original_run"]
                                 }
                             }
                         },
-                        "required": ["id", "translated", "run_mapping"]
+                        "required": ["id", "translated", "translated_runs"]
                     }
                 }
             },
@@ -264,23 +265,20 @@ class PPTXTranslator:
         source_lang_name = self.lang_map.get(self.source_lang, self.source_lang)
         target_lang_name = self.lang_map.get(self.target_lang, self.target_lang)
         
-        # 翻訳対象テキストとrun情報をJSON用に整形
+        # 翻訳対象テキストとrun情報を整形
         texts_data = []
         for i, pair in enumerate(presentation_data.all_pairs):
+            runs_info = []
+            for j, run_style in enumerate(pair.position.run_styles):
+                runs_info.append({
+                    "index": j,
+                    "text": run_style.text
+                })
+            
             text_data = {
                 "id": i,
                 "text": pair.text,
-                "runs": [
-                    {
-                        "index": j,
-                        "text": run_style.text,
-                        "style_info": f"font:{run_style.font_name}, size:{run_style.font_size}",
-                        "is_whitespace": run_style.text.strip() == "",
-                        "has_leading_space": run_style.text.startswith(" ") or run_style.text.startswith("\t"),
-                        "has_trailing_space": run_style.text.endswith(" ") or run_style.text.endswith("\t")
-                    }
-                    for j, run_style in enumerate(pair.position.run_styles)
-                ]
+                "runs": runs_info
             }
             texts_data.append(text_data)
         
@@ -288,57 +286,48 @@ class PPTXTranslator:
         
         prompt = f"""
 Translate the following texts from {source_lang_name} to {target_lang_name}.
-Maintain the same tone and style. Keep technical terms consistent.
 
-IMPORTANT - CONTEXT AND NUANCE PRESERVATION:
-- Consider the overall context of the presentation when translating each text
+IMPORTANT REQUIREMENTS:
+- Translate each text as a coherent paragraph/sentence
+- Maintain the same tone and style throughout
+- Keep technical terms consistent across all translations  
 - Preserve the original text's nuance, emotional tone, and formality level
-- Maintain consistency in terminology and style throughout the entire presentation
-- Pay attention to the relationship between different text elements (titles, bullet points, etc.)
-- Ensure translations flow naturally while preserving the original meaning and intent
-- Consider cultural context and adapt expressions appropriately for the target language
 
-CRITICAL - LENGTH AND CONTENT ACCURACY:
-- Keep the translation as close as possible to the original text length
-- Do NOT add extra explanations, elaborations, or supplementary information
-- Do NOT omit or skip any parts of the original text
-- Translate only what is present in the original - nothing more, nothing less
-- Prioritize accuracy and completeness over natural flow when there's a conflict
-- Each translated element should correspond directly to the original element
+CRITICAL - TRANSLATED RUN SEGMENTATION:
+After translating each text, you must:
 
-IMPORTANT: Each text consists of multiple "runs" with different styles. You must provide a "run_mapping" that maps parts of your translation to specific original run indices.
+1. Split the translated text into meaningful runs (segments) that correspond to semantic units
+2. For each translated run, identify which original run it is most semantically similar to
+3. The number of translated runs may differ from original runs - focus on semantic meaning
 
-CRITICAL - SPACE PRESERVATION:
-- Pay attention to spaces, whitespace, and punctuation in the original runs
-- If a run contains only spaces or whitespace, preserve equivalent spacing in translation
-- If a run has leading or trailing spaces (has_leading_space/has_trailing_space flags), preserve those spaces in the translation
-- Ensure proper spacing between words and phrases in the translation
-- The concatenation of all "translated_text" must equal the full "translated" text exactly
+SEGMENTATION PRINCIPLES:
+- Split translated text at natural semantic boundaries (words, phrases, concepts)
+- Consider which parts should have similar formatting (emphasis, highlighting, etc.)
+- Each translated run should correspond to the most semantically similar original run
+- Preserve formatting intent: if original run was emphasized, find the equivalent emphasis in translation
 
-Input texts with run information:
+EXAMPLES:
+Original: "Hello **world**" (runs: ["Hello ", "world"])
+Translation: "こんにちは世界" 
+Translated runs: [
+  {{"text": "こんにちは", "best_match_original_run": 0}},
+  {{"text": "世界", "best_match_original_run": 1}}
+]
+
+Original: "**Important:** Please read" (runs: ["Important", ":", " Please read"])
+Translation: "重要：必ずお読みください"
+Translated runs: [
+  {{"text": "重要", "best_match_original_run": 0}},
+  {{"text": "：", "best_match_original_run": 1}},
+  {{"text": "必ずお読みください", "best_match_original_run": 2}}
+]
+
+Input texts with runs:
 {texts_json}
 
 For each translation, provide:
 1. "translated": The complete translated text
-2. "run_mapping": An array mapping translation parts to original runs
-   - "original_run_index": The index of the original run (0-based)
-   - "translated_text": The part of translation that should use this run's style
-
-EXAMPLES:
-1. If original runs are: ["Hello", " ", "World"]
-   Your run_mapping might be: [
-     {{"original_run_index": 0, "translated_text": "こんにちは"}},
-     {{"original_run_index": 1, "translated_text": " "}},
-     {{"original_run_index": 2, "translated_text": "世界"}}
-   ]
-
-2. If original runs are: ["Hello ", "World"] (note trailing space in first run)
-   Your run_mapping might be: [
-     {{"original_run_index": 0, "translated_text": "こんにちは "}},
-     {{"original_run_index": 1, "translated_text": "世界"}}
-   ]
-
-Return the translations in the specified JSON schema format.
+2. "translated_runs": Array of translated runs with their best matching original run indices
 """
         
         self.logger.info("翻訳リクエストを送信中...")
@@ -352,11 +341,11 @@ Return the translations in the specified JSON schema format.
         )
 
         # JSONレスポンスを解析
-        translations, run_mappings = self._parse_json_translations_with_mapping(response.text, presentation_data.all_pairs)
-        return translations, run_mappings
+        translations, translated_runs = self._parse_json_translations_with_runs(response.text, presentation_data.all_pairs)
+        return translations, translated_runs
     
-    def _parse_json_translations_with_mapping(self, response_text: str, all_pairs: List[TextPositionPair]) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
-        """JSON形式の翻訳レスポンス（run_mapping付き）をパース"""
+    def _parse_json_translations_with_runs(self, response_text: str, all_pairs: List[TextPositionPair]) -> Tuple[List[str], List[List[Dict[str, Any]]]]:
+        """JSON形式の翻訳レスポンス（翻訳後runs付き）をパース"""
         try:
             response_data: Dict[str, Any] = json.loads(response_text)
         except json.JSONDecodeError as e:
@@ -368,31 +357,31 @@ Return the translations in the specified JSON schema format.
         translations_data.sort(key=lambda x: x.get("id", 0))
 
         translations = []
-        run_mappings = []
+        translated_runs_list = []
 
         for i, pair in enumerate(all_pairs):
             found_translation = None
-            found_run_mapping = []
+            found_translated_runs = []
 
             for trans_item in translations_data:
                 if trans_item.get("id") == i:
                     found_translation = trans_item.get("translated", "")
-                    found_run_mapping = trans_item.get("run_mapping", [])
+                    found_translated_runs = trans_item.get("translated_runs", [])
                     break
             
             if found_translation is None:
-                # デフォルトの処理
+                # デフォルトの処理：翻訳前のrunsをそのまま使用
                 found_translation = pair.text
-                found_run_mapping = [
-                    {"original_run_index": j, "translated_text": style.text}
+                found_translated_runs = [
+                    {"text": style.text, "best_match_original_run": j}
                     for j, style in enumerate(pair.position.run_styles)
                 ]
             
             translations.append(found_translation)
-            run_mappings.append(found_run_mapping)
+            translated_runs_list.append(found_translated_runs)
         
         self.logger.info(f"翻訳完了: {len(translations)} 件")
-        return translations, run_mappings
+        return translations, translated_runs_list
 
     
     def _create_fallback_mapping(self, translated_text: str, original_run_styles: List[RunStyleInfo]) -> List[Dict[str, Any]]:
@@ -458,46 +447,43 @@ Return the translations in the specified JSON schema format.
         except Exception as e:
             self.logger.debug(f"スタイル適用エラー: {e}")
     
-    def replace_text_with_run_mapping(self, paragraph: _Paragraph, translated_text: str, run_styles: List[RunStyleInfo], run_mapping: List[Dict[str, Any]]) -> None:
-        """run_mappingを使用してスタイルを保持してテキストを置換"""
+    def replace_text_with_translated_runs(self, paragraph: _Paragraph, translated_text: str, original_run_styles: List[RunStyleInfo], translated_runs: List[Dict[str, Any]]) -> None:
+        """翻訳後runsに基づいて最適なスタイルを適用してテキストを置換"""
         try:
-            if not run_styles or not run_mapping:
-                # スタイル情報やマッピング情報がない場合は単純置換
+            if not original_run_styles or not translated_runs:
+                # スタイル情報や翻訳runs情報がない場合は単純置換
                 paragraph.text = translated_text
                 return
             
             # paragraphをクリア
             paragraph.text = ""
             
-            # run_mappingをoriginal_run_indexでソート
-            sorted_mapping = sorted(run_mapping, key=lambda x: x.get("original_run_index", 0))
-            
-            # 新しいrunを作成してスタイルを適用
-            for mapping_item in sorted_mapping:
-                original_run_index = mapping_item.get("original_run_index", 0)
-                translated_part = mapping_item.get("translated_text", "")
+            # 翻訳後runsに基づいて新しいrunを作成
+            for translated_run in translated_runs:
+                run_text = translated_run.get("text", "")
+                best_match_original_index = translated_run.get("best_match_original_run", 0)
                 
-                if not translated_part:
+                if not run_text:
                     continue
                 
                 # 対応する元のスタイルを取得
-                if 0 <= original_run_index < len(run_styles):
-                    original_style = run_styles[original_run_index]
+                if 0 <= best_match_original_index < len(original_run_styles):
+                    original_style = original_run_styles[best_match_original_index]
                 else:
                     # インデックスが範囲外の場合は最初のスタイルを使用
-                    original_style = run_styles[0] if run_styles else None
+                    original_style = original_run_styles[0] if original_run_styles else None
                 
                 # 新しいrunを追加
                 run = paragraph.add_run()
-                run.text = translated_part
+                run.text = run_text
                 
-                # 元のスタイルを適用
+                # 意味的に最も近い元のrunのスタイルを適用
                 if original_style:
                     self.apply_run_style(run, original_style)
         
         except Exception as e:
             # エラーの場合は単純置換にフォールバック
-            self.logger.error(f"run mapping置換エラー: {e}")
+            self.logger.error(f"翻訳runs置換エラー: {e}")
             paragraph.text = translated_text
     
     def translate_pptx(self, input_path: str, output_path: str) -> bool:
@@ -517,12 +503,16 @@ Return the translations in the specified JSON schema format.
             self.logger.info(f"翻訳開始: {input_path}")
 
             # プレゼンテーション全体を翻訳
-            translations, run_mappings = self.translate_presentation_with_gemini(presentation_data)
+            translations, translated_runs_list = self.translate_presentation_with_gemini(presentation_data)
+
+            # 翻訳対応をログ出力
+            if self.show_correspondence:
+                self._log_correspondence(presentation_data, translations)
 
             # コピーしたファイルを開いて翻訳を適用
             prs = Presentation(output_path)
             
-            for i, (translation, run_mapping, pair) in enumerate(zip(translations, run_mappings, presentation_data.all_pairs)):
+            for i, (translation, translated_runs, pair) in enumerate(zip(translations, translated_runs_list, presentation_data.all_pairs)):
                 try:
                     position = pair.position
                     
@@ -548,8 +538,8 @@ Return the translations in the specified JSON schema format.
                         # 通常のテキストフレーム
                         paragraph = shape.text_frame.paragraphs[position.para_idx]
                     
-                    # run mappingを使用してテキストを置換
-                    self.replace_text_with_run_mapping(paragraph, translation, position.run_styles, run_mapping)
+                    # 翻訳テキストを意味的対応関係に基づいてスタイル適用
+                    self.replace_text_with_translated_runs(paragraph, translation, position.run_styles, translated_runs)
                     
                 except Exception as e:
                     self.logger.error(f"テキスト置換エラー (インデックス {i}): {e}")
@@ -563,6 +553,31 @@ Return the translations in the specified JSON schema format.
             self.logger.error(f"翻訳処理エラー: {e}")
             return False
 
+    def _log_correspondence(self, presentation_data: PresentationData, translations: List[str]) -> None:
+        """翻訳対応をログで表示"""
+        self.logger.info("=" * 80)
+        self.logger.info("翻訳対応表")
+        self.logger.info("=" * 80)
+        
+        for i, (pair, translation) in enumerate(zip(presentation_data.all_pairs, translations)):
+            original_text = pair.text
+            position = pair.position
+            
+            # 位置情報の文字列表現を作成
+            if isinstance(position, TableCellPosition):
+                location = f"スライド{position.slide_idx + 1}, 表 行{position.table_row + 1}列{position.table_col + 1}"
+            elif isinstance(position, GroupedShapePosition):
+                location = f"スライド{position.slide_idx + 1}, グループ図形 {'.'.join(map(str, position.group_path))}"
+            else:
+                location = f"スライド{position.slide_idx + 1}, 図形{position.shape_idx + 1}"
+            
+            self.logger.info(f"[{i + 1}] {location}")
+            self.logger.info(f"元の文: {original_text}")
+            self.logger.info(f"翻訳文: {translation}")
+            self.logger.info("-" * 40)
+        
+        self.logger.info("=" * 80)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PPTX翻訳スクリプト (Gemini API使用)")
@@ -571,6 +586,7 @@ def main() -> None:
     parser.add_argument("-s", "--source", default="ja", help="翻訳元言語 (デフォルト: ja)")
     parser.add_argument("-t", "--target", default="en", help="翻訳先言語 (デフォルト: en)")
     parser.add_argument("-m", "--model", default="gemini-2.5-flash", help="使用するモデル名 (デフォルト: gemini-2.5-flash)")
+    parser.add_argument("--show-correspondence", action="store_true", help="翻訳前後の対応をログで表示")
 
     args = parser.parse_args()
     
@@ -587,7 +603,12 @@ def main() -> None:
         output_file = str(input_path.parent / f"{input_path.stem}_{args.target}.pptx")
 
     # 翻訳処理
-    translator = PPTXTranslator(args.source, args.target, args.model)
+    translator = PPTXTranslator(
+        args.source, 
+        args.target, 
+        args.model,
+        show_correspondence=args.show_correspondence
+    )
     success = translator.translate_pptx(args.input_file, output_file)
     
     if success:
