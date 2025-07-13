@@ -384,14 +384,6 @@ For each translation, provide:
         return translations, translated_runs_list
 
     
-    def _create_fallback_mapping(self, translated_text: str, original_run_styles: List[RunStyleInfo]) -> List[Dict[str, Any]]:
-        """フォールバックのrun mappingを作成"""
-        if not original_run_styles:
-            return [{"original_run_index": 0, "translated_text": translated_text}]
-        
-        # 最初のrunに全テキストを割り当て
-        return [{"original_run_index": 0, "translated_text": translated_text}]
-    
     def apply_run_style(self, run: _Run, run_style: RunStyleInfo) -> None:
         """runにスタイルを適用"""
         try:
@@ -554,10 +546,10 @@ For each translation, provide:
             return False
 
     def _log_correspondence(self, presentation_data: PresentationData, translations: List[str]) -> None:
-        """翻訳対応をログで表示"""
-        self.logger.info("=" * 80)
-        self.logger.info("翻訳対応表")
-        self.logger.info("=" * 80)
+        """翻訳対応を標準出力で表示"""
+        print("=" * 80)
+        print("翻訳対応表")
+        print("=" * 80)
         
         for i, (pair, translation) in enumerate(zip(presentation_data.all_pairs, translations)):
             original_text = pair.text
@@ -571,12 +563,12 @@ For each translation, provide:
             else:
                 location = f"スライド{position.slide_idx + 1}, 図形{position.shape_idx + 1}"
             
-            self.logger.info(f"[{i + 1}] {location}")
-            self.logger.info(f"元の文: {original_text}")
-            self.logger.info(f"翻訳文: {translation}")
-            self.logger.info("-" * 40)
+            print(f"[{i + 1}] {location}")
+            print(f"元の文: {original_text}")
+            print(f"翻訳文: {translation}")
+            print("-" * 40)
         
-        self.logger.info("=" * 80)
+        print("=" * 80)
 
 
 def main() -> None:
@@ -586,7 +578,7 @@ def main() -> None:
     parser.add_argument("-s", "--source", default="ja", help="翻訳元言語 (デフォルト: ja)")
     parser.add_argument("-t", "--target", default="en", help="翻訳先言語 (デフォルト: en)")
     parser.add_argument("-m", "--model", default="gemini-2.5-flash", help="使用するモデル名 (デフォルト: gemini-2.5-flash)")
-    parser.add_argument("--show-correspondence", action="store_true", help="翻訳前後の対応をログで表示")
+    parser.add_argument("--no-correspondence", action="store_true", help="翻訳前後の対応表示を無効化")
 
     args = parser.parse_args()
     
@@ -607,7 +599,7 @@ def main() -> None:
         args.source, 
         args.target, 
         args.model,
-        show_correspondence=args.show_correspondence
+        show_correspondence=not args.no_correspondence
     )
     success = translator.translate_pptx(args.input_file, output_file)
     
